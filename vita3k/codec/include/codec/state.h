@@ -73,6 +73,16 @@ struct DecoderState {
 
     std::mutex codec_mutex;
 
+    /**
+     * @brief Bytes available in the caller's output buffer, UINT32_MAX meaning "no limit".
+     *
+     * Decoders write straight into the caller's buffer, so a stream that decodes to more data
+     * than the caller budgeted for would run past the end of it. A caller that knows the size of
+     * its buffer sets this before receive(); the decoder then refuses to write beyond it and
+     * reports only what it actually produced.
+     */
+    uint32_t output_capacity = UINT32_MAX;
+
     virtual uint32_t get(DecoderQuery query);
 
     virtual void flush();
@@ -233,11 +243,33 @@ struct AacDecoderState : public DecoderState {
     SwrContext *swr = nullptr;
     AVFrame *frame;
     uint32_t es_size_used;
+    /// Channel count swr was configured to emit (the guest's declared layout).
+    uint32_t out_channels = 1;
+
+    /**
+     * @brief Whether the current decoded frame still has to be handed to the resampler.
+     *
+     * Each packet's frame is fed exactly once. Feeding it again would duplicate audio; skipping it
+     * would lose the packet. swr buffers whatever its output side cannot take, so the frame is
+     * always supplied in full.
+     */
+    bool frame_feedable = false;
+
     uint32_t get(DecoderQuery query) override;
 
     bool send(const uint8_t *data, uint32_t size) override;
     bool receive(uint8_t *data, DecoderSize *size) override;
     uint32_t get_es_size() override;
+
+    /**
+     * @brief Drop all decoded but not yet delivered audio, and reset the codec.
+     *
+     * Overriding this matters because the resampler keeps a backlog of its own: the base class
+     * only flushes libavcodec, which would leave those samples behind. After ClearContext the
+     * decoder is reused for a different stream, and stale audio from the previous one must not
+     * leak into it.
+     */
+    void flush() override;
 
     explicit AacDecoderState(uint32_t sample_rate, uint32_t channels);
     ~AacDecoderState() override;

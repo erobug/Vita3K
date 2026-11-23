@@ -22,6 +22,9 @@
 #include <ngs/state.h>
 #include <ngs/system.h>
 #include <util/log.h>
+
+#include <algorithm>
+#include <atomic>
 #include <util/tracy.h>
 
 TRACY_MODULE_NAME(SceNgs);
@@ -63,7 +66,7 @@ static ngs::Voice *find_patch_source_voice(ngs::State &ngs, const MemState &mem,
             continue;
         }
 
-        for (ngs::Rack *rack : system->racks) {
+        for (ngs::Rack *rack : system->racks()) {
             if (!rack) {
                 continue;
             }
@@ -74,7 +77,11 @@ static ngs::Voice *find_patch_source_voice(ngs::State &ngs, const MemState &mem,
                     continue;
                 }
 
-                for (const auto &patches : voice->patches) {
+                // [ngs-fix] routing table is host-side, keyed by the guest voice address
+                auto *table = rack->find_patch_table(voice_handle, mem);
+                if (!table)
+                    continue;
+                for (const auto &patches : *table) {
                     for (const Ptr<ngs::Patch> owned_patch : patches) {
                         if (owned_patch == patch) {
                             return voice;
@@ -232,7 +239,7 @@ EXPORT(int, sceNgsPatchCreateRouting, SceNgsPatchSetupInfo *patch_info, Ptr<ngs:
     if (!source)
         return RET_ERROR(SCE_NGS_ERROR);
 
-    *handle = source->rack->system->voice_scheduler.patch(emuenv.mem, patch_info);
+    *handle = source->rack->system->voice_scheduler().patch(emuenv.mem, patch_info);
 
     if (!*handle) {
         return RET_ERROR(SCE_NGS_ERROR);
@@ -358,8 +365,8 @@ EXPORT(SceInt32, sceNgsRackRelease, ngs::Rack *rack, Ptr<void> callback) {
     if (!rack)
         return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
 
-    std::unique_lock<std::recursive_mutex> lock(rack->system->voice_scheduler.mutex);
-    if (!rack->system->voice_scheduler.is_updating) {
+    std::unique_lock<std::recursive_mutex> lock(rack->system->voice_scheduler().mutex);
+    if (!rack->system->voice_scheduler().is_updating) {
         ngs::release_rack(emuenv.ngs, emuenv.mem, rack->system, rack);
     } else if (!callback) {
         // wait for the update to finish
@@ -367,7 +374,7 @@ EXPORT(SceInt32, sceNgsRackRelease, ngs::Rack *rack, Ptr<void> callback) {
         // but I don't think this is allowed (and if it is I don't know how to prevent this)
         LOG_WARN_ONCE("sceNgsRackRelease called in a synchronous way during a ngs update, contact devs if your game softlocks now.");
 
-        rack->system->voice_scheduler.condvar.wait(lock);
+        rack->system->voice_scheduler().condvar.wait(lock);
         ngs::release_rack(emuenv.ngs, emuenv.mem, rack->system, rack);
     } else {
         // destroy rack asynchronously
@@ -377,7 +384,7 @@ EXPORT(SceInt32, sceNgsRackRelease, ngs::Rack *rack, Ptr<void> callback) {
         op.release_data.state = &emuenv.ngs;
         op.release_data.rack = rack;
         op.release_data.callback = callback.address();
-        rack->system->voice_scheduler.operations_pending.push(op);
+        rack->system->voice_scheduler().operations_pending.push(op);
     }
 
     return SCE_NGS_OK;
@@ -429,11 +436,11 @@ EXPORT(SceInt32, sceNgsSystemRelease, ngs::System *system) {
         return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
 
     {
-        std::unique_lock<std::recursive_mutex> lock(system->voice_scheduler.mutex);
-        if (system->voice_scheduler.is_updating) {
+        std::unique_lock<std::recursive_mutex> lock(system->voice_scheduler().mutex);
+        if (system->voice_scheduler().is_updating) {
             LOG_WARN_ONCE("sceNgsSystemRelease called during a ngs update, contact devs if your game softlocks now.");
 
-            system->voice_scheduler.condvar.wait(lock);
+            system->voice_scheduler().condvar.wait(lock);
         }
     }
 
@@ -463,7 +470,8 @@ EXPORT(SceUInt32, sceNgsSystemUpdate, ngs::System *system) {
         return 0;
     }
 
-    system->voice_scheduler.update(emuenv.kernel, emuenv.mem, thread_id);
+
+    system->voice_scheduler().update(emuenv.kernel, emuenv.mem, thread_id);
 
     return SCE_NGS_OK;
 }
@@ -695,10 +703,10 @@ EXPORT(SceInt32, sceNgsVoiceGetInfo, ngs::Voice *voice, SceNgsVoiceInfo *info) {
         return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
     }
 
-    const std::lock_guard<std::mutex> guard(*voice->voice_mutex);
+    const std::lock_guard<std::mutex> guard(voice->mutex());
 
     info->voice_state = ngsVoiceStateFromHLEState(voice);
-    info->num_modules = static_cast<SceUInt32>(voice->datas.size());
+    info->num_modules = static_cast<SceUInt32>(voice->datas().size());
     info->num_inputs = static_cast<SceUInt32>(voice->inputs.inputs.size());
     info->num_outputs = voice->rack->vdef->output_count;
     info->num_patches_per_output = static_cast<SceUInt32>(voice->rack->patches_per_output);
@@ -759,7 +767,14 @@ EXPORT(SceInt32, sceNgsVoiceGetOutputPatch, ngs::Voice *voice, const SceInt32 ou
         return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
     }
 
-    *patch = voice->patches[output_index][output_subindex];
+    // [ngs-fix] routing table is host-side, keyed by the guest voice address
+    auto *patch_table = voice->rack->find_patch_table(Ptr<ngs::Voice>(voice, emuenv.mem), emuenv.mem);
+    if (!patch_table || output_index >= static_cast<SceInt32>(patch_table->size()))
+        return RET_ERROR(SCE_NGS_ERROR_INVALID_HANDLE);
+    if (output_subindex >= static_cast<SceInt32>((*patch_table)[output_index].size()))
+        return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
+
+    *patch = (*patch_table)[output_index][output_subindex];
     ngs::Patch *output_patch = nullptr;
     if (*patch) {
         if (!patch->valid(emuenv.mem)) {
@@ -817,7 +832,7 @@ EXPORT(SceInt32, sceNgsVoiceInit, ngs::Voice *voice, const SceNgsVoicePreset *pr
     if (voice->state == ngs::VoiceState::VOICE_STATE_ACTIVE)
         return RET_ERROR(SCE_NGS_ERROR_INVALID_STATE);
 
-    std::lock_guard<std::mutex> guard(*voice->voice_mutex);
+    std::lock_guard<std::mutex> guard(voice->mutex());
 
     if (init_flags == SCE_NGS_VOICE_INIT_BASE || init_flags == SCE_NGS_VOICE_INIT_ALL) {
         voice->state = ngs::VoiceState::VOICE_STATE_AVAILABLE;
@@ -825,10 +840,13 @@ EXPORT(SceInt32, sceNgsVoiceInit, ngs::Voice *voice, const SceNgsVoicePreset *pr
 
     if (init_flags & SCE_NGS_VOICE_INIT_ROUTING) {
         // reset all patches
-        for (auto &patches : voice->patches) {
-            for (auto &patch : patches) {
-                if (patch) {
-                    patch.get(emuenv.mem)->output_sub_index = -1;
+        // [ngs-fix] routing table is host-side, keyed by the guest voice address
+        if (auto *table = voice->rack->find_patch_table(Ptr<ngs::Voice>(voice, emuenv.mem), emuenv.mem)) {
+            for (auto &patches : *table) {
+                for (auto &patch : patches) {
+                    if (patch) {
+                        patch.get(emuenv.mem)->output_sub_index = -1;
+                    }
                 }
             }
         }
@@ -839,7 +857,7 @@ EXPORT(SceInt32, sceNgsVoiceInit, ngs::Voice *voice, const SceNgsVoicePreset *pr
             STUBBED("Default preset not implemented");
             for (size_t i = 0; i < voice->rack->modules.size(); i++) {
                 if (voice->rack->modules[i])
-                    voice->rack->modules[i]->set_default_preset(emuenv.mem, voice->datas[i]);
+                    voice->rack->modules[i]->set_default_preset(emuenv.mem, voice->datas()[i]);
             }
         } else if (!voice->set_preset(emuenv.mem, preset)) {
             return RET_ERROR(SCE_NGS_ERROR);
@@ -847,7 +865,7 @@ EXPORT(SceInt32, sceNgsVoiceInit, ngs::Voice *voice, const SceNgsVoicePreset *pr
     }
 
     if (init_flags & SCE_NGS_VOICE_INIT_CALLBACKS) {
-        for (auto &module_data : voice->datas) {
+        for (auto &module_data : voice->datas()) {
             module_data.callback = Ptr<void>();
         }
     }
@@ -865,9 +883,9 @@ EXPORT(SceInt32, sceNgsVoiceKeyOff, ngs::Voice *voice) {
         return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
     }
 
-    // The next system update ends the voice and calls its finished callback, as games may hold their own locks here
-    voice->rack->system->voice_scheduler.off(emuenv.mem, voice);
-
+    // A keyed off voice ends on the next system update, which calls its finished callback
+    // outside the game's lock.
+    voice->rack->system->voice_scheduler().off(emuenv.mem, voice);
     return SCE_NGS_OK;
 }
 
@@ -881,7 +899,8 @@ EXPORT(int, sceNgsVoiceKill, ngs::Voice *voice) {
         return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
     }
 
-    voice->rack->system->voice_scheduler.stop(emuenv.mem, voice);
+
+    voice->rack->system->voice_scheduler().stop(emuenv.mem, voice);
 
     return 0;
 }
@@ -921,7 +940,15 @@ EXPORT(SceInt32, sceNgsVoicePatchSetVolume, ngs::Patch *patch, const SceInt32 ou
     if (!emuenv.cfg.current_config.ngs_enable)
         return SCE_NGS_OK;
 
-    if (!patch || patch->output_sub_index == -1)
+    // [ngs-fix] A patch handle stays valid after its routing slot is released (output_sub_index
+    // becomes -1), and the title legitimately sets the volume on it before re-routing or to
+    // preconfigure the next patch. Rejecting those calls left volume_matrix at zero, so the
+    // source mixed to silence: that is why sound effects were inaudible while music (whose
+    // patch the title configures after routing) worked.
+    if (!patch)
+        return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
+
+    if (output_channel < 0 || output_channel > 1 || input_channel < 0 || input_channel > 1)
         return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
 
     patch->volume_matrix[output_channel][input_channel] = vol;
@@ -934,7 +961,11 @@ EXPORT(SceInt32, sceNgsVoicePatchSetVolumes, ngs::Patch *patch, const SceInt32 o
     if (!emuenv.cfg.current_config.ngs_enable)
         return SCE_NGS_OK;
 
-    if (!patch || patch->output_sub_index == -1)
+    // [ngs-fix] see sceNgsVoicePatchSetVolume: do not reject an unrouted patch.
+    if (!patch || !volumes)
+        return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
+
+    if (output_channel < 0 || output_channel > 1)
         return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
 
     for (int i = 0; i < std::min(vols, 2); i++)
@@ -948,7 +979,10 @@ EXPORT(SceInt32, sceNgsVoicePatchSetVolumesMatrix, ngs::Patch *patch, const SceN
     if (!emuenv.cfg.current_config.ngs_enable)
         return 0;
 
-    if (!patch || patch->output_sub_index == -1)
+    // [ngs-fix] see sceNgsVoicePatchSetVolume: an unrouted patch must still accept its matrix,
+    // otherwise the title believes it muted a source while the matrix stays at its old value,
+    // and a newly prepared patch keeps the all-zero matrix that mixes to silence.
+    if (!patch || !matrix)
         return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
 
     memcpy(patch->volume_matrix, matrix->matrix, sizeof(matrix->matrix));
@@ -969,7 +1003,7 @@ EXPORT(int, sceNgsVoicePause, ngs::Voice *voice) {
     if (voice->is_paused)
         return RET_ERROR(SCE_NGS_ERROR_INVALID_STATE);
 
-    if (!voice->rack->system->voice_scheduler.pause(emuenv.mem, voice)) {
+    if (!voice->rack->system->voice_scheduler().pause(emuenv.mem, voice)) {
         return RET_ERROR(SCE_NGS_ERROR);
     }
 
@@ -987,8 +1021,36 @@ EXPORT(SceUInt32, sceNgsVoicePlay, ngs::Voice *voice) {
     }
 
     voice->is_pending = true;
-    if (!voice->rack->system->voice_scheduler.play(emuenv.mem, voice)) {
-        return RET_ERROR(SCE_NGS_ERROR);
+
+    // [ngs-fix] VoicePlay on an already-running voice is not an error on hardware, but it also
+    // does not restart anything. Answer each state for what it really is rather than reporting
+    // success and letting the caller believe a restart happened:
+    //
+    //   AVAILABLE                 -> actually start it (the normal path)
+    //   ACTIVE, already queued    -> success, nothing to do
+    //   ACTIVE, not queued        -> requeue through deque_insert so patch dependencies still
+    //                                decide where it goes; a plain push_back would put a voice
+    //                                ahead of the voices it consumes
+    //   FINALIZING                -> refuse. The scheduler's update() calls stop() on this voice
+    //                                unconditionally after its finished callback returns, so
+    //                                accepting here would promise a restart that cannot happen.
+    auto &sched = voice->rack->system->voice_scheduler();
+    const bool started = sched.play(emuenv.mem, voice);
+    if (!started) {
+        if (voice->state == ngs::VoiceState::VOICE_STATE_FINALIZING) {
+            // Ending has already been decided this frame; a restart would be undone immediately.
+            voice->is_pending = false;
+            return RET_ERROR(SCE_NGS_ERROR);
+        }
+
+        if (voice->state == ngs::VoiceState::VOICE_STATE_ACTIVE) {
+            // Already running. If it slipped out of the queue, put it back through the scheduler
+            // so patch dependency order is honoured.
+            sched.requeue_active(emuenv.mem, voice);
+        } else {
+            voice->is_pending = false;
+            return RET_ERROR(SCE_NGS_ERROR);
+        }
     }
     voice->is_pending = false;
 
@@ -1008,7 +1070,7 @@ EXPORT(int, sceNgsVoiceResume, ngs::Voice *voice) {
     if (!voice->is_paused)
         return SCE_NGS_OK;
 
-    if (!voice->rack->system->voice_scheduler.resume(emuenv.mem, voice)) {
+    if (!voice->rack->system->voice_scheduler().resume(emuenv.mem, voice)) {
         return RET_ERROR(SCE_NGS_ERROR);
     }
 
@@ -1059,7 +1121,7 @@ EXPORT(SceInt32, sceNgsVoiceSetParamsBlock, ngs::Voice *voice, const SceNgsModul
     if (!voice)
         return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
 
-    const std::lock_guard<std::mutex> guard(*voice->voice_mutex);
+    const std::lock_guard<std::mutex> guard(voice->mutex());
 
     const SceInt32 num_errors = voice->parse_params_block(emuenv.mem, header, size);
     if (pNumErrors != nullptr) {
@@ -1080,7 +1142,7 @@ EXPORT(SceInt32, sceNgsVoiceSetPreset, ngs::Voice *voice, const SceNgsVoicePrese
     if (!voice || !preset)
         return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
 
-    const std::lock_guard<std::mutex> guard(*voice->voice_mutex);
+    const std::lock_guard<std::mutex> guard(voice->mutex());
     if (!voice->set_preset(emuenv.mem, preset))
         return RET_ERROR(SCE_NGS_ERROR);
 

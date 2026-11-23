@@ -24,6 +24,10 @@ extern "C" {
 
 #include <util/log.h>
 
+#include <atomic>
+#include <map>
+#include <mutex>
+
 /* PSVita ADPCM table */
 static const int16_t hevag_coefs[128][4] = {
     { 0, 0, 0, 0 },
@@ -169,6 +173,7 @@ bool PCMDecoderState::send(const uint8_t *data, uint32_t size) {
     const std::uint8_t *source_transformed = data;
     std::uint32_t produced_samples = 0;
 
+
     std::vector<std::int16_t> transformed;
 
     if (he_adpcm) {
@@ -264,18 +269,31 @@ bool PCMDecoderState::send(const uint8_t *data, uint32_t size) {
     // Try to resample if necessary
     SwrContext *swr = (source_channels == 2) ? swr_stereo : swr_mono_to_stereo;
 
+    // swr_get_out_samples() is an upper bound, not the amount that will actually be produced.
+    // The previous code resized final_result to that bound, converted, then ignored the real
+    // return value -- so whenever fewer samples came out than predicted, receive() handed the
+    // caller a mix of real audio and whatever was left in the tail from the previous call. With
+    // the resampler's internal buffering that shows up as periodically repeated or stale blocks,
+    // audibly slowing the stream down.
     const int dest_count = swr_get_out_samples(swr, produced_samples);
-
-    final_result.resize(sizeof(float) * dest_count * 2);
-    if (dest_count == 0) {
+    if (dest_count <= 0) {
+        final_result.clear();
         return true;
     }
 
-    std::uint8_t *dest_data = &final_result[0];
+    final_result.resize(sizeof(float) * dest_count * 2);
 
-    // the result value contains the actual amount of converted sample, but it should be the same as
-    // dest_count because we are not resampling
+    std::uint8_t *dest_data = final_result.data();
     const int result = swr_convert(swr, &dest_data, dest_count, &source_transformed, produced_samples);
+
+    if (result < 0) {
+        final_result.clear();
+        return false;
+    }
+
+    // Keep exactly the samples that were produced.
+    final_result.resize(sizeof(float) * static_cast<size_t>(result) * 2);
+
     return true;
 }
 

@@ -264,21 +264,46 @@ static int decode_audio_frames(EmuEnvState &emuenv, const char *export_name, Sce
     ctrl->pcm_size_given = 0;
 
     for (uint32_t frame = 0; frame < nb_frames; frame++) {
-        DecoderSize size;
-        if (!decoder->send(es_data, ctrl->es_size_max)
-            || !decoder->receive(pcm_data, &size)) {
+        // Guest buffer already full: nothing can be written this round.
+        if (ctrl->pcm_size_given >= ctrl->pcm_size_max)
+            break;
+
+        if (!decoder->send(es_data, ctrl->es_size_max))
             return RET_ERROR(SCE_AUDIODEC_ERROR_API_FAIL);
-        }
 
         uint32_t es_size_used = std::min(decoder->get_es_size(), ctrl->es_size_max);
         assert(es_size_used <= ctrl->es_size_max);
         ctrl->es_size_used += es_size_used;
         es_data += es_size_used;
 
-        uint32_t pcm_size_given = size.samples * decoder->get(DecoderQuery::CHANNELS) * sizeof(int16_t);
-        assert(pcm_size_given <= ctrl->pcm_size_max);
-        ctrl->pcm_size_given += pcm_size_given;
-        pcm_data += pcm_size_given;
+        // Take everything this packet produced. The resampler can hold a backlog from earlier
+        // frames, so one receive() is not necessarily enough to drain it -- delivering just one
+        // chunk per call is what truncated a voice after its opening syllables.
+        for (;;) {
+            const uint32_t remaining = (ctrl->pcm_size_given < ctrl->pcm_size_max)
+                ? ctrl->pcm_size_max - ctrl->pcm_size_given
+                : 0;
+            if (remaining == 0)
+                break;
+
+            decoder->output_capacity = remaining;
+
+            DecoderSize size;
+            if (!decoder->receive(pcm_data, &size))
+                return RET_ERROR(SCE_AUDIODEC_ERROR_API_FAIL);
+
+            if (size.samples == 0)
+                break;
+
+            const uint32_t channels = decoder->get(DecoderQuery::CHANNELS);
+            uint32_t pcm_size_given = size.samples * channels * sizeof(int16_t);
+
+            if (pcm_size_given > remaining)
+                pcm_size_given = remaining;
+
+            ctrl->pcm_size_given += pcm_size_given;
+            pcm_data += pcm_size_given;
+        }
     }
 
     return 0;
@@ -418,6 +443,10 @@ EXPORT(int, sceAudiodecPartlyDecode, SceAudiodecCtrl *ctrl, SceUInt32 samples_of
     const uint32_t bytes_per_sample = decoder->get(DecoderQuery::CHANNELS) * sizeof(int16_t);
     ctrl->es_size_used = 0;
     ctrl->pcm_size_given = 0;
+    // This shape decodes into a scratch vector sized from its own query, not into the guest PCM
+    // block, so the guest budget does not apply. Clear any limit left behind by
+    // decode_audio_frames, otherwise the loop below could be handed less than it asked for.
+    decoder->output_capacity = UINT32_MAX;
     std::vector<uint8_t> temp_storage;
     temp_storage.reserve((samples_offset + samples_to_decode) * bytes_per_sample);
 

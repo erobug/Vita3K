@@ -53,10 +53,49 @@ struct SceNgsReverbParams {
 
 namespace ngs {
 
+// Per-voice reverb network.
+//
+// Holds the delay-line vectors, so it must be a properly constructed host object. It lives in
+// ModuleData::runtime_state, whose lifetime is tied to the voice. It used to be stored as raw
+// bytes in scratch_data and reached through reinterpret_cast plus memset, which never ran the
+// vectors' constructors and wiped their pointers whenever the network was re-tuned.
+struct ReverbModuleState : public ModuleRuntimeState {
+    struct Comb {
+        std::vector<float> buffer;
+        int index = 0;
+        float feedback = 0.0f;
+        float damp = 0.0f;
+        float filter_store = 0.0f;
+
+        void init(int length, float fb, float dampening);
+        float process(float input);
+    };
+
+    struct Allpass {
+        std::vector<float> buffer;
+        int index = 0;
+
+        void init(int length);
+        float process(float input);
+    };
+
+    Comb combs[4][2];
+    Allpass allpasses[2][2];
+
+    bool initialised = false;
+    float sample_rate = 48000.0f;
+
+    ReverbModuleState() = default;
+    ~ReverbModuleState() override = default;
+};
+
 class ReverbModule : public Module {
 public:
     bool process(KernelState &kern, const MemState &mem, const SceUID thread_id, ModuleData &data, std::unique_lock<std::recursive_mutex> &scheduler_lock, std::unique_lock<std::mutex> &voice_lock) override;
     uint32_t module_id() const override { return 0x5CE7; }
+
+    std::unique_ptr<ModuleRuntimeState> create_runtime_state() const override;
+    void cleanup_voice_state(ModuleData &data) override;
 
     static constexpr uint32_t get_max_parameter_size() {
         return sizeof(SceNgsReverbParams);
