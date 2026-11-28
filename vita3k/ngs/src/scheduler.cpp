@@ -22,6 +22,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
+#include <util/log.h>
 #include <util/vector_utils.h>
 
 namespace ngs {
@@ -37,23 +39,27 @@ void VoiceScheduler::deque_insert(const MemState &mem, Voice *voice) {
     int32_t lowest_dest_pos = queue.size();
 
     // Check its dependencies position
-    for (auto &patches : voice->patches) {
-        for (const auto patch : patches) {
-            if (!patch) {
-                continue;
-            }
+    // [ngs-fix] the routing table is host-side now, keyed by the guest voice address
+    auto *table = voice->rack ? voice->rack->find_patch_table(Ptr<Voice>(voice, mem), mem) : nullptr;
+    if (table) {
+        for (auto &patches : *table) {
+            for (const auto patch : patches) {
+                if (!patch) {
+                    continue;
+                }
 
-            Voice *dest = patch.get(mem)->dest.get(mem);
-            if (!dest) {
-                continue;
-            }
-            const int32_t pos = get_position(dest);
+                Voice *dest = patch.get(mem)->dest.get(mem);
+                if (!dest) {
+                    continue;
+                }
+                const int32_t pos = get_position(dest);
 
-            if (pos == -1) {
-                continue;
-            }
+                if (pos == -1) {
+                    continue;
+                }
 
-            lowest_dest_pos = std::min<int32_t>(lowest_dest_pos, pos);
+                lowest_dest_pos = std::min<int32_t>(lowest_dest_pos, pos);
+            }
         }
     }
 
@@ -62,8 +68,9 @@ void VoiceScheduler::deque_insert(const MemState &mem, Voice *voice) {
 
 bool VoiceScheduler::play(const MemState &mem, Voice *voice) {
     const std::lock_guard<std::recursive_mutex> guard(mutex);
-    if (voice->state != VOICE_STATE_AVAILABLE)
+    if (voice->state != VOICE_STATE_AVAILABLE) {
         return false;
+    }
 
     // Transition
     voice->transition(mem, VOICE_STATE_ACTIVE);
@@ -100,6 +107,21 @@ bool VoiceScheduler::resume(const MemState &mem, Voice *voice) {
     if (voice->state == VOICE_STATE_ACTIVE)
         deque_insert(mem, voice);
 
+    return true;
+}
+
+bool VoiceScheduler::requeue_active(const MemState &mem, Voice *voice) {
+    const std::lock_guard<std::recursive_mutex> guard(mutex);
+    if (voice->state != VOICE_STATE_ACTIVE)
+        return false;
+    if (voice->is_paused)
+        return false;
+    if (std::ranges::find(queue, voice) != queue.end())
+        return false;
+
+    // deque_insert places the voice before the destinations it feeds, so a resumed voice cannot
+    // jump ahead of its dependencies.
+    deque_insert(mem, voice);
     return true;
 }
 
@@ -144,7 +166,7 @@ void VoiceScheduler::update(KernelState &kern, const MemState &mem, const SceUID
 
     for (ngs::Voice *voice : queue_copy) {
         // Modify the state, in peace....
-        std::unique_lock<std::mutex> voice_lock(*voice->voice_mutex);
+        std::unique_lock<std::mutex> voice_lock(voice->mutex());
         memset(voice->products, 0, sizeof(voice->products));
 
         const bool keyed_off = voice->state == VOICE_STATE_FINALIZING;
@@ -153,7 +175,7 @@ void VoiceScheduler::update(KernelState &kern, const MemState &mem, const SceUID
 
         for (size_t i = 0; !keyed_off && i < voice->rack->modules.size(); i++) {
             if (voice->rack->modules[i]) {
-                if (voice->rack->modules[i]->process(kern, mem, thread_id, voice->datas[i], scheduler_lock, voice_lock)) {
+                if (voice->rack->modules[i]->process(kern, mem, thread_id, voice->datas()[i], scheduler_lock, voice_lock)) {
                     finished = true;
                     finished_module = voice->rack->modules[i]->module_id();
                 }
@@ -175,8 +197,9 @@ void VoiceScheduler::update(KernelState &kern, const MemState &mem, const SceUID
         }
 
         for (size_t i = 0; i < voice->rack->vdef->output_count; i++) {
-            if (voice->products[i].data)
+            if (voice->products[i].data) {
                 deliver_data(mem, queue_copy, voice, static_cast<uint8_t>(i), voice->products[i]);
+            }
         }
 
         voice->frame_count++;
@@ -216,28 +239,31 @@ bool VoiceScheduler::resort_to_respect_dependencies(const MemState &mem, Voice *
     }
 
     // Check all dependencies, could be optimized- @sunho suggested dfs topological sort
-    for (size_t i = 0; i < source->patches.size(); i++) {
-        for (const auto &patch : source->patches[i]) {
-            if (!patch || !patch.get(mem)->is_active()) {
-                continue;
-            }
+    auto *dep_table = source->rack ? source->rack->find_patch_table(Ptr<Voice>(source, mem), mem) : nullptr;
+    if (dep_table) {
+        for (size_t i = 0; i < dep_table->size(); i++) {
+            for (const auto &patch : (*dep_table)[i]) {
+                if (!patch || !patch.get(mem)->is_active()) {
+                    continue;
+                }
 
-            Voice *dest = patch.get(mem)->dest.get(mem);
-            if (!dest) {
-                continue;
-            }
-            const int32_t dest_pos = get_position(dest);
+                Voice *dest = patch.get(mem)->dest.get(mem);
+                if (!dest) {
+                    continue;
+                }
+                const int32_t dest_pos = get_position(dest);
 
-            if (dest_pos == -1) {
-                // Maybe not scheduled yet. Continue
-                continue;
-            }
+                if (dest_pos == -1) {
+                    // Maybe not scheduled yet. Continue
+                    continue;
+                }
 
-            if (dest_pos < position) {
-                // Switch to the end. Resort dependencies for this one that just got sorted too.
-                std::rotate(queue.begin() + dest_pos, queue.begin() + dest_pos + 1, queue.end());
-                resort_to_respect_dependencies(mem, dest);
-                position = get_position(source);
+                if (dest_pos < position) {
+                    // Switch to the end. Resort dependencies for this one that just got sorted too.
+                    std::rotate(queue.begin() + dest_pos, queue.begin() + dest_pos + 1, queue.end());
+                    resort_to_respect_dependencies(mem, dest);
+                    position = get_position(source);
+                }
             }
         }
     }

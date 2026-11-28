@@ -80,6 +80,16 @@ public:
     bool stop(const MemState &mem, Voice *voice);
     bool off(const MemState &mem, Voice *voice);
 
+    /**
+     * @brief Put an already-active voice back into the processing queue.
+     *
+     * Used when a title calls sceNgsVoicePlay on a voice that is running but has fallen out of the
+     * queue. Goes through deque_insert so patch dependency order is preserved; appending directly
+     * would schedule the voice ahead of the voices it consumes. Returns false if the voice is not
+     * active, is paused, or is already queued.
+     */
+    bool requeue_active(const MemState &mem, Voice *voice);
+
     void update(KernelState &kern, const MemState &mem, const SceUID thread_id);
 
     Ptr<Patch> patch(const MemState &mem, SceNgsPatchSetupInfo *info);

@@ -279,7 +279,11 @@ struct VoiceInputManager {
 struct Voice {
     Rack *rack;
 
-    std::vector<ModuleData> datas;
+    // [ngs-fix] Voice is placement-new'ed into the guest memspace, so it must not carry host
+    // containers: `datas` (vector<ModuleData>, each ModuleData owning 4 vectors + 2
+    // unique_ptrs), the patch routing table and the per-voice mutex all live host-side, keyed
+    // by this voice's guest address. Guest writes over those members used to leave the host
+    // holding corrupt objects (null derefs / fastfail). Access via datas() / mutex().
     VoiceState state;
     bool is_pending;
     bool is_paused;
@@ -287,12 +291,16 @@ struct Voice {
     uint32_t frame_count;
 
     using Patches = std::vector<Ptr<Patch>>;
+    using ModuleDatas = std::vector<ModuleData>;
 
-    std::array<Patches, MAX_OUTPUT_PORT> patches;
+    ModuleDatas &datas();
+    const ModuleDatas &datas() const;
+
+    std::mutex &mutex();
+    std::mutex *find_mutex();
 
     VoiceInputManager inputs;
 
-    std::unique_ptr<std::mutex> voice_mutex;
     VoiceProduct products[MAX_VOICE_OUTPUT];
 
     Ptr<void> finished_callback;
@@ -313,6 +321,17 @@ struct Voice {
 
     void invoke_callback(KernelState &kernel, const MemState &mem, const SceUID thread_id, Ptr<void> callback, Ptr<void> user_data,
         const uint32_t module_id, const uint32_t reason = 0, const uint32_t reason2 = 0, Address reason_ptr = 0);
+
+    /**
+     * @brief Drop every host-side entry belonging to this voice.
+     *
+     * The side tables (module data, mutex, patch routing) are keyed by the voice's host address,
+     * so they must be erased when the voice is destroyed. Leaving them behind leaks host memory
+     * and hands a recycled voice the previous one's routing table. Takes the host pointer so the
+     * key matches the one the accessors use -- see the definition for why the guest Ptr would
+     * not.
+     */
+    static void release_host_state(const Voice *self);
 };
 
 struct System;
@@ -328,21 +347,34 @@ struct Rack : public MempoolObject {
     std::vector<Ptr<Voice>> voices;
     std::vector<std::unique_ptr<Module>> modules;
 
+    using PatchTable = std::array<std::vector<Ptr<Patch>>, MAX_OUTPUT_PORT>;
+
+    // [ngs-fix] Per-voice patch routing tables live host-side, keyed by the voice's host address.
+    // Both Rack and Voice sit in guest memory, so these cannot be members there. Entries are
+    // released by Voice::release_host_state(), so no separate drop function is needed.
+    PatchTable &patch_table_for(const Ptr<Voice> voice, const MemState &mem);
+    PatchTable *find_patch_table(const Ptr<Voice> voice, const MemState &mem);
+
     explicit Rack(System *mama, const Ptr<void> memspace, const uint32_t memspace_size);
 
     static uint32_t get_required_memspace_size(MemState &mem, SceNgsRackDescription *description);
 };
 
 struct System : public MempoolObject {
-    std::vector<Rack *> racks;
+    // [ngs-fix] `racks` and VoiceScheduler (which embeds recursive_mutex and
+    // condition_variable_any) live host-side too -- see system_host_state() in ngs.cpp.
     int32_t max_voices;
     int32_t granularity;
     int32_t sample_rate;
 
-    VoiceScheduler voice_scheduler;
-
     explicit System(const Ptr<void> memspace, const uint32_t memspace_size);
     static uint32_t get_required_memspace_size(SceNgsSystemInitParams *parameters);
+
+    std::vector<Rack *> &racks();
+    VoiceScheduler &voice_scheduler();
+
+    /// Drop the host-side state owned by this system (its rack list and scheduler).
+    void release_host_state();
 };
 
 bool deliver_data(const MemState &mem, const std::vector<Voice *> &voice_queue, Voice *source, const uint8_t output_port,

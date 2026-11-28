@@ -20,6 +20,7 @@
 #include <util/types.h>
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
@@ -45,6 +46,9 @@ struct AudioOutPort {
     uint64_t len_microseconds = 0;
     // last time sceAudioOutOutput was called with this port (timestamp in microseconds)
     uint64_t last_output = 0;
+    // high-resolution timestamp used for pacing; steady_clock never jumps when the wall clock is
+    // adjusted, which the old system_clock-based subtraction did.
+    std::chrono::steady_clock::time_point last_output_steady{};
 
     // current config
     int type = 0;

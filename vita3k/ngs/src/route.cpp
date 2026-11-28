@@ -16,6 +16,9 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <ngs/system.h>
+#include <util/log.h>
+
+#include <atomic>
 
 #include <util/vector_utils.h>
 
@@ -26,7 +29,14 @@ bool deliver_data(const MemState &mem, const std::vector<Voice *> &voice_queue, 
         return false;
     }
 
-    for (auto &patch_ptr : source->patches[output_port]) {
+    // [ngs-fix] routing table is host-side, keyed by the guest voice address
+    if (!source->rack || output_port >= MAX_OUTPUT_PORT)
+        return false;
+    auto *table = source->rack->find_patch_table(Ptr<Voice>(source, mem), mem);
+    if (!table)
+        return false;
+
+    for (auto &patch_ptr : (*table)[output_port]) {
         Patch *patch = patch_ptr.get(mem);
 
         if (!patch || !patch->is_active())
@@ -36,7 +46,7 @@ bool deliver_data(const MemState &mem, const std::vector<Voice *> &voice_queue, 
         if (!dest || !std::ranges::contains(voice_queue, dest))
             continue;
 
-        const std::lock_guard<std::mutex> guard(*dest->voice_mutex);
+        const std::lock_guard<std::mutex> guard(dest->mutex());
         dest->inputs.receive(mem, patch, data_to_deliver);
     }
 

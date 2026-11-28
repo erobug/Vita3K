@@ -18,6 +18,8 @@
 #include <ngs/modules/atrac9.h>
 #include <util/log.h>
 
+#include <atomic>
+
 extern "C" {
 #include <libswresample/swresample.h>
 }
@@ -300,18 +302,36 @@ bool Atrac9Module::process(KernelState &kern, const MemState &mem, const SceUID 
     Atrac9RuntimeState *runtime = data.get_runtime_state<Atrac9RuntimeState>();
     assert(state);
 
+    // [ngs-fix] No buffer yet is NOT "playback finished". Returning true here made the scheduler
+    // treat a freshly created ATRAC9 voice as completed and stop() it, so every ATRAC9 voice --
+    // which is what this title uses for its sound effects -- was torn down before the guest ever
+    // got a chance to queue audio. Report "not finished" and emit a silent block instead.
     if (state->current_buffer == -1
         || !params->buffer_params[state->current_buffer].buffer) {
-        return true;
+        const uint32_t gran = static_cast<uint32_t>(data.parent->rack->system->granularity);
+        if (gran > 0) {
+            data.ensure_scratch_size(static_cast<size_t>(gran) * sizeof(float) * 2);
+            std::ranges::fill(data.scratch_data, 0);
+            data.parent->products[0].data = data.scratch_data.data();
+        }
+        return false;
     }
 
     logical->decoded_pcm.compact();
 
     bool is_finished = false;
     // call decode more data until we either have an error or reached end of data
+    uint32_t decode_iterations = 0;
     while (static_cast<int32_t>(logical->decoded_pcm.available_frames()) < data.parent->rack->system->granularity) {
         if (!decode_more_data(kern, mem, thread_id, data, params, state, logical, runtime, scheduler_lock, voice_lock)) {
             is_finished = true;
+            break;
+        }
+
+        // Guard against a voice whose buffer never yields a full granularity, which would keep
+        // this loop spinning inside the scheduler forever and hang the audio thread.
+        if (++decode_iterations > 64) {
+            LOG_WARN_ONCE("Atrac9 voice produced no audio after 64 decode attempts; giving up on this block.");
             break;
         }
     }

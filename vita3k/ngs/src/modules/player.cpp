@@ -123,6 +123,7 @@ bool PlayerModule::process(KernelState &kern, const MemState &mem, const SceUID 
 
     logical->decoded_pcm.compact();
 
+
     while (static_cast<int>(logical->decoded_pcm.available_frames()) < granularity) {
         if ((state->current_buffer == -1)
             || !params->buffer_params[state->current_buffer].buffer
@@ -140,8 +141,18 @@ bool PlayerModule::process(KernelState &kern, const MemState &mem, const SceUID 
                 }
             }
 
-            // Stop processing if no valid buffer is available or if the buffer is empty
-            finished = true;
+            // [ngs-fix] A voice with no queued buffer has not finished - the guest may simply not
+            // have filled it yet. Reporting "finished" made the scheduler stop() the voice, so a
+            // newly created voice could be torn down before its first buffer arrived. Emit a
+            // silent block and keep the voice alive; the END_OF_DATA path above handles a real
+            // end of stream.
+            {
+                const uint32_t gran = static_cast<uint32_t>(granularity);
+                if (gran > 0) {
+                    data.ensure_scratch_size(static_cast<size_t>(gran) * sizeof(float) * 2);
+                    std::ranges::fill(data.scratch_data, 0);
+                }
+            }
             break;
         } else if (state->current_byte_position_in_buffer >= params->buffer_params[state->current_buffer].bytes_count) {
             const int32_t prev_index = state->current_buffer;
@@ -168,6 +179,12 @@ bool PlayerModule::process(KernelState &kern, const MemState &mem, const SceUID 
                     voice_lock.lock();
                     break;
                 } else {
+                    // [upstream] The callback reports which buffer just finished and hands over the
+                    // address to refill. This is the upstream form; an earlier revision of this
+                    // patch passed the finished buffer instead, on the theory that refilling the
+                    // live buffer caused half-speed playback. That theory was wrong: the half-speed
+                    // defect was SBR doubling the reported PCM size in SceAudiodecUser.cpp, and
+                    // reverting this to upstream leaves Kiniro no Corda voice playback correct.
                     data.invoke_callback(kern, mem, thread_id, SCE_NGS_PLAYER_SWAPPED_BUFFER, prev_index,
                         params->buffer_params[state->current_buffer].buffer.address());
                 }
@@ -215,6 +232,7 @@ bool PlayerModule::process(KernelState &kern, const MemState &mem, const SceUID 
         const uint8_t *chunk = input + state->current_byte_position_in_buffer;
         bool decoded_new_audio = true;
         uint32_t consumed_bytes = bytes_to_send;
+
 
         if (runtime->decoder->he_adpcm) {
             const uint32_t carried_bytes = static_cast<uint32_t>(logical->adpcm_buffer.size());
@@ -278,6 +296,7 @@ bool PlayerModule::process(KernelState &kern, const MemState &mem, const SceUID 
 
         runtime->decoder->receive(nullptr, &samples_count);
 
+
         // Playback rate scaling
         float src_sample_rate = params->playback_frequency;
         if ((src_sample_rate >= 1.f) && ((params->playback_scalar != 1.f) || (static_cast<int>(src_sample_rate) != sample_rate))) {
@@ -301,6 +320,7 @@ bool PlayerModule::process(KernelState &kern, const MemState &mem, const SceUID 
 
     const uint32_t available_samples = logical->decoded_pcm.available_frames();
     const uint32_t samples_to_be_passed = std::min<uint32_t>(available_samples, granularity);
+
 
     if (available_samples >= static_cast<uint32_t>(granularity)) {
         data.parent->products[0].data = logical->decoded_pcm.read_bytes();

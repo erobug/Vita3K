@@ -197,9 +197,18 @@ int main(int argc, char *argv[]) {
         if (qt_app) {
             std::atexit(SDL_Quit);
             if (!SDL_Init(SDL_INIT_AUDIO | SDL_INIT_GAMEPAD | SDL_INIT_HAPTIC | SDL_INIT_SENSOR)) {
-                LOG_ERROR("SDL initialisation failed: {}", SDL_GetError());
-                QMessageBox::critical(nullptr, "Error", "SDL initialisation failed.");
-                return SDLInitFailed;
+                // Haptic support goes through COM on Windows, and creating its device can fail
+                // even when everything else works (a stale or contended COM object is enough).
+                // Rumble is a nicety, so fall back to starting without it rather than refusing
+                // to run: an emulator that will not open is much worse than one without rumble.
+                LOG_WARN("SDL initialisation with haptic support failed: {}", SDL_GetError());
+                SDL_ClearError();
+                if (!SDL_Init(SDL_INIT_AUDIO | SDL_INIT_GAMEPAD | SDL_INIT_SENSOR)) {
+                    LOG_ERROR("SDL initialisation failed: {}", SDL_GetError());
+                    QMessageBox::critical(nullptr, "Error", "SDL initialisation failed.");
+                    return SDLInitFailed;
+                }
+                LOG_WARN("Continuing without haptic support; controller rumble will be unavailable.");
             }
             if (!SDL_InitSubSystem(SDL_INIT_CAMERA))
                 LOG_WARN("SDL camera initialisation failed, continuing without it: {}", SDL_GetError());

@@ -103,21 +103,36 @@ void AudioState::audio_output(AudioOutPort &out_port, const void *buffer) {
     if (out_port.stopping)
         return;
 
-    uint64_t now = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-    uint64_t diff = now - out_port.last_output;
-    uint64_t to_wait = out_port.len_microseconds - diff;
-    if (diff < out_port.len_microseconds && to_wait > 1000) {
-        // This is what we should be waiting to be perfectly accurate
-        // However, doing so would cause the host audio buffer to often lack samples to output
-        // This is because the PS Vita and the host audio parameters do not match exactly
-        // So instead only wait 50% of the time
-        // also don't sleep for less than 0.5 ms
-        to_wait /= 2;
-        std::this_thread::sleep_for(std::chrono::microseconds(to_wait));
-        out_port.last_output = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-    } else {
-        out_port.last_output = now;
+    // Pace the guest to the real audio clock. sleep_for() on Windows rounds up to the system timer
+    // resolution (~15.6 ms), which is longer than a 10.67 ms block, so the deadline is scheduled
+    // absolutely and only the bulk of the wait is slept -- the remainder is spun to land precisely.
+    const auto period = std::chrono::microseconds(out_port.len_microseconds);
+    if (out_port.len_microseconds == 0)
+        return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (out_port.last_output_steady.time_since_epoch().count() == 0)
+        out_port.last_output_steady = now;
+
+    auto deadline = out_port.last_output_steady + period;
+    // Resynchronise if we are more than a period behind instead of catching up in a burst.
+    if (deadline + period < now)
+        deadline = now;
+
+    if (deadline > now) {
+        const auto remaining = deadline - now;
+        if (remaining > std::chrono::microseconds(2000)) {
+            std::this_thread::sleep_for(remaining - std::chrono::microseconds(1500));
+        }
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
     }
+
+    out_port.last_output_steady = deadline;
+    out_port.last_output = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
 }
 
 void AudioState::set_volume(AudioOutPort &out_port, float volume) {
