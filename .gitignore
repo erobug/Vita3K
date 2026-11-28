@@ -44,7 +44,8 @@ vcpkg_installed/
 # Gradle files
 .gradle/
 build/
-
+build-msvc/
+build-*/
 # Local configuration file (sdk path, etc)
 local.properties
 
